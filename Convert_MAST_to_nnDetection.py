@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Convert the MAST dataset to a lung-only nnDetection dataset.
+Convert the MAST dataset to a lung-only nnDetection dataset (voxel-based version).
 - Keeps only lesions with lesion_type == 'Lung'.
-- Uses volume_bl / volume_fu > 0 to check if the lesion exists in each scan.
+- Determines lesion presence by checking if voxels with that lesion_id exist in the mask.
 - Processes both baseline (BL) and follow-up (FU) scans independently.
 - Renumbers lung lesion voxel values consecutively (1..N) with no gaps.
 - No resampling allowed — raises error if shapes differ.
@@ -32,7 +32,7 @@ for d in [IMAGES_DIR, LABELS_DIR]:
 
 # === DATASET METADATA ===
 TASK_NAME = "Task_LungLesions"
-DESCRIPTION = "Filtered subset of MAST containing only lung lesions (BL + FU, verified via non-zero volume)."
+DESCRIPTION = "Filtered subset of MAST containing only lung lesions (BL + FU, voxel-based presence check)."
 REFERENCE = "https://fdat.uni-tuebingen.de/records/75kj1-64747"
 
 # === HELPERS ===
@@ -62,7 +62,7 @@ for csv_path in sorted(SOURCE_INPUTS.glob("*.csv")):
     print(f"\n Processing patient: {patient_id}")
 
     df = pd.read_csv(csv_path)
-    if not {"lesion_id", "lesion_type", "volume_bl", "volume_fu"}.issubset(df.columns):
+    if "lesion_id" not in df.columns or "lesion_type" not in df.columns:
         print(f"⚠️ Skipping {csv_path.name} (missing required columns).")
         continue
 
@@ -74,7 +74,7 @@ for csv_path in sorted(SOURCE_INPUTS.glob("*.csv")):
         continue
 
     # Prepare both scan types
-    for scan_type, vol_col in [("BL", "volume_bl"), ("FU", "volume_fu")]:
+    for scan_type in ["BL", "FU"]:
         img_file = find_file(SOURCE_INPUTS, f"{patient_id}_{scan_type}_img_00.nii*")
 
         # Mask search order depends on scan type
@@ -91,12 +91,6 @@ for csv_path in sorted(SOURCE_INPUTS.glob("*.csv")):
         print(f" Using {scan_type} image: {img_file.name}")
         print(f" Using {scan_type} mask:  {mask_file.name}")
 
-        # Lesion IDs present in this scan (volume > 0)
-        lesion_ids = lung_df.loc[lung_df[vol_col] > 0, "lesion_id"].astype(int).tolist()
-        if not lesion_ids:
-            print(f"⚠️ No lung lesions with {vol_col}>0 for {patient_id} ({scan_type}). Skipping.")
-            continue
-
         # Load mask and image
         mask_nii = nib.load(str(mask_file))
         mask_data = mask_nii.get_fdata().astype(np.int32)
@@ -108,10 +102,12 @@ for csv_path in sorted(SOURCE_INPUTS.glob("*.csv")):
                 f"mask {mask_data.shape} vs image {img_nii.shape}."
             )
 
-        # Keep only these lesion IDs and renumber consecutively
+        # Lesion IDs present in the mask (voxel-based check)
+        lesion_ids = lung_df["lesion_id"].astype(int).tolist()
         present_ids = [lid for lid in lesion_ids if (mask_data == lid).any()]
+
         if not present_ids:
-            print(f"⚠️ No voxels found for listed lung lesions in {mask_file.name}.")
+            print(f"⚠️ No voxels found for listed lung lesions in {mask_file.name}. Skipping.")
             continue
 
         present_ids.sort()

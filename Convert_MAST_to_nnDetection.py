@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""
+Convert the MAST dataset to a lung-only nnDetection dataset.
+- Keeps only lesions with lesion_type == 'Lung'.
+- Uses volume_bl / volume_fu > 0 to check if the lesion exists in each scan.
+- Processes both baseline (BL) and follow-up (FU) scans independently.
+- Renumbers lung lesion voxel values consecutively (1..N) with no gaps.
+- No resampling allowed — raises error if shapes differ.
+- Creates nnDetection-ready dataset.json.
+- Prints clear per-patient breakdown of lung lesions.
+"""
+
+import os
+import json
+import shutil
+from pathlib import Path
+from collections import defaultdict
+import pandas as pd
+import numpy as np
+import nibabel as nib
+from tqdm import tqdm
+
+# === PATHS ===
+SOURCE_INPUTS = Path("C:/Users/merli/Desktop/HVA/jaar 3/Stage/Data preprocessing/mast-samples/inputsTr")
+SOURCE_TARGETS = Path("C:/Users/merli/Desktop/HVA/jaar 3/Stage/Data preprocessing/mast-samples/targetsTr")
+TARGET_ROOT = Path("C:/Users/merli/Desktop/HVA/jaar 3/Stage/Data preprocessing/Task_LungLesions")
+
+IMAGES_DIR = TARGET_ROOT / "imagesTr"
+LABELS_DIR = TARGET_ROOT / "labelsTr"
+for d in [IMAGES_DIR, LABELS_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+
+# === DATASET METADATA ===
+TASK_NAME = "Task_LungLesions"
+DESCRIPTION = "Filtered subset of MAST containing only lung lesions (BL + FU, verified via non-zero volume)."
+REFERENCE = "https://fdat.uni-tuebingen.de/records/75kj1-64747"
+
+# === HELPERS ===
+def nn_name(filename: str) -> str:
+    """Append _0000.nii.gz if missing for nnDetection."""
+    if filename.endswith(".nii.gz"):
+        filename = filename[:-7]
+    elif filename.endswith(".nii"):
+        filename = filename[:-4]
+    return filename + "_0000.nii.gz"
+
+def find_file(base: Path, pattern: str):
+    matches = list(base.glob(pattern))
+    return matches[0] if matches else None
+
+
+# === MAIN PROCESSING ===
+cases = []
+kept_log = []
+num_patients = 0
+num_cases = 0
+num_lesions_total = 0
+
+for csv_path in sorted(SOURCE_INPUTS.glob("*.csv")):
+    patient_id = csv_path.stem.split("_")[0]
+    num_patients += 1
+    print(f"\n Processing patient: {patient_id}")
+
+    df = pd.read_csv(csv_path)
+    if not {"lesion_id", "lesion_type", "volume_bl", "volume_fu"}.issubset(df.columns):
+        print(f"⚠️ Skipping {csv_path.name} (missing required columns).")
+        continue
+
+    # Select lung lesions
+    df["lesion_type"] = df["lesion_type"].astype(str).str.strip().str.lower()
+    lung_df = df[df["lesion_type"] == "lung"]
+    if lung_df.empty:
+        print(f"❌ No lung lesions found in {csv_path.name}.")
+        continue
+
+    # Prepare both scan types
+    for scan_type, vol_col in [("BL", "volume_bl"), ("FU", "volume_fu")]:
+        img_file = find_file(SOURCE_INPUTS, f"{patient_id}_{scan_type}_img_00.nii*")
+
+        # Mask search order depends on scan type
+        if scan_type == "BL":
+            mask_file = find_file(SOURCE_INPUTS, f"{patient_id}_{scan_type}_mask_00.nii*")
+        else:  # FU
+            mask_file = find_file(SOURCE_TARGETS, f"{patient_id}_{scan_type}_mask_00.nii*") \
+                        or find_file(SOURCE_INPUTS, f"{patient_id}_{scan_type}_mask_00.nii*")
+
+        if not img_file or not mask_file:
+            print(f"⚠️ Missing {scan_type} image or mask for {patient_id}.")
+            continue
+
+        print(f" Using {scan_type} image: {img_file.name}")
+        print(f" Using {scan_type} mask:  {mask_file.name}")
+
+        # Lesion IDs present in this scan (volume > 0)
+        lesion_ids = lung_df.loc[lung_df[vol_col] > 0, "lesion_id"].astype(int).tolist()
+        if not lesion_ids:
+            print(f"⚠️ No lung lesions with {vol_col}>0 for {patient_id} ({scan_type}). Skipping.")
+            continue
+
+        # Load mask and image
+        mask_nii = nib.load(str(mask_file))
+        mask_data = mask_nii.get_fdata().astype(np.int32)
+        img_nii = nib.load(str(img_file))
+
+        if mask_data.shape != img_nii.shape:
+            raise RuntimeError(
+                f"❌ Shape mismatch in {patient_id}_{scan_type}: "
+                f"mask {mask_data.shape} vs image {img_nii.shape}."
+            )
+
+        # Keep only these lesion IDs and renumber consecutively
+        present_ids = [lid for lid in lesion_ids if (mask_data == lid).any()]
+        if not present_ids:
+            print(f"⚠️ No voxels found for listed lung lesions in {mask_file.name}.")
+            continue
+
+        present_ids.sort()
+        print(f"   -> {scan_type} kept lesion_ids: {present_ids}")
+
+        new_mask = np.zeros_like(mask_data, dtype=np.int16)
+        for new_id, old_id in enumerate(present_ids, start=1):
+            new_mask[mask_data == old_id] = new_id
+
+        num_lesions_total += len(present_ids)
+        num_cases += 1
+        kept_log.append({"patient": patient_id, "scan": scan_type, "count": len(present_ids)})
+
+        # Save filtered mask
+        mask_out = LABELS_DIR / f"{patient_id}_{scan_type}_mask_00_lung.nii.gz"
+        nib.save(nib.Nifti1Image(new_mask, affine=mask_nii.affine, header=mask_nii.header), str(mask_out))
+
+        # Copy image
+        img_out = IMAGES_DIR / nn_name(f"{patient_id}_{scan_type}_img_00.nii")
+        shutil.copy2(img_file, img_out)
+
+        # Record case in dataset.json
+        cases.append({
+            "image": str(img_out.relative_to(TARGET_ROOT)),
+            "label": str(mask_out.relative_to(TARGET_ROOT))
+        })
+
+        print(f"✅ {scan_type}: {len(present_ids)} lung lesion(s) kept and renumbered.")
+
+# === CREATE DATASET.JSON ===
+dataset_json = {
+    "name": TASK_NAME,
+    "description": DESCRIPTION,
+    "tensorImageSize": "3D",
+    "reference": REFERENCE,
+    "licence": "CC BY 4.0",
+    "release": "1.0",
+    "modality": {"0": "CT"},
+    "labels": {"0": "background", "1": "lung_lesion"},
+    "numTraining": len(cases),
+    "training": cases,
+    "test": []
+}
+
+with open(TARGET_ROOT / "dataset.json", "w") as f:
+    json.dump(dataset_json, f, indent=4)
+
+# === FINAL SUMMARY ===
+print("\n Breakdown by patient/scan (lung lesions kept):")
+by_patient = defaultdict(lambda: {"BL": 0, "FU": 0})
+for row in kept_log:
+    by_patient[row["patient"]][row["scan"]] += row["count"]
+
+for pid, c in by_patient.items():
+    print(f" - {pid}: BL={c['BL']}  FU={c['FU']}  (total={c['BL'] + c['FU']})")
+
+print(f"\n✅ Patients processed: {num_patients}")
+print(f"✅ Total BL/FU cases exported: {num_cases}")
+print(f"✅ Total lung lesions kept: {num_lesions_total}")
+print(f"✅ Output directory: {TARGET_ROOT}")
+print(f"✅ dataset.json created with {len(cases)} entries.\n")
+
+# === VALIDATION BLOCK ===
+print("\n Running dataset validation...\n")
+
+valid_count = 0
+shape_mismatch = 0
+empty_masks = 0
+missing_files = 0
+
+for item in cases:
+    img_path = TARGET_ROOT / item["image"]
+    lbl_path = TARGET_ROOT / item["label"]
+
+    if not img_path.exists() or not lbl_path.exists():
+        print(f"❌ Missing file for pair: {item}")
+        missing_files += 1
+        continue
+
+    img = nib.load(str(img_path))
+    lbl = nib.load(str(lbl_path))
+    img_shape = img.shape
+    lbl_shape = lbl.shape
+
+    if img_shape != lbl_shape:
+        print(f"⚠️ Shape mismatch: {img_path.name} vs {lbl_path.name}")
+        shape_mismatch += 1
+        continue
+
+    mask_data = lbl.get_fdata()
+    if not np.any(mask_data):
+        print(f"⚠️ Empty mask: {lbl_path.name}")
+        empty_masks += 1
+        continue
+
+    valid_count += 1
+
+print("\n Validation summary:")
+print(f"✅ Valid image/mask pairs: {valid_count}")
+print(f"⚠️ Shape mismatches: {shape_mismatch}")
+print(f"⚠️ Empty masks: {empty_masks}")
+print(f"❌ Missing files: {missing_files}")
+
+if shape_mismatch == 0 and empty_masks == 0 and missing_files == 0:
+    print("\n✅ All dataset pairs are valid and ready for nnDetection training!")
+else:
+    print("\n⚠️ Some issues detected — check the warnings above before training.")

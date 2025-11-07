@@ -20,9 +20,9 @@ import nibabel as nib
 from tqdm import tqdm
 
 # === PATHS ===
-SOURCE_INPUTS = Path("C:/Users/merli/Desktop/HVA/jaar 3/Stage/Data preprocessing/mast-samples/inputsTr")
-SOURCE_TARGETS = Path("C:/Users/merli/Desktop/HVA/jaar 3/Stage/Data preprocessing/mast-samples/targetsTr")
-TARGET_ROOT = Path("C:/Users/merli/Desktop/HVA/jaar 3/Stage/Data preprocessing/Task_LungLesions")
+SOURCE_INPUTS = Path(os.environ["SOURCE_INPUTS"])
+SOURCE_TARGETS = Path(os.environ["SOURCE_TARGETS"])
+TARGET_ROOT = Path(os.environ["TARGET_ROOT"])
 
 IMAGES_DIR = TARGET_ROOT / "imagesTr"
 LABELS_DIR = TARGET_ROOT / "labelsTr"
